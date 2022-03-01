@@ -82,6 +82,9 @@ static struct {
 	size_t   threads;
 	int      write_parity;
 	uint64_t wsize;
+	unsigned dump;
+	unsigned chksum;
+	unsigned fill;
 } cfg = {
 	.check          = 0,
 	.chunk_size     = 4096,
@@ -99,6 +102,9 @@ static struct {
 	.skip_read      = 0,
 	.skip_write     = 0,
 	.threads        = 1,
+	.dump           = 0,
+	.chksum         = 0,
+	.fill           = 0,
 };
 
 struct thread_info {
@@ -139,6 +145,28 @@ static void print_buf(void *buf, size_t len)
 	uint8_t *cbuf = buf;
 	for (int i = len-1; i >= 0; i--)
 		printf("%02X", cbuf[i]);
+}
+
+static void print_buf16(void *buf, size_t len)
+{
+	uint8_t *cbuf = buf;
+
+	for (int i = len-1; i >= 0; i--) {
+		printf("%02X", cbuf[i]);
+		if ((i & 0xf) == 0)
+			printf("\n");
+	}
+}
+
+static uint64_t checksum_buf16(void *buf, uint64_t prev, size_t len)
+{
+	uint64_t *cbuf = (uint64_t *) buf;
+	uint64_t *ebuf = (uint64_t *) (buf + len);
+
+	for (; cbuf < ebuf; ++cbuf)
+		prev ^= *cbuf;
+
+	return prev;
 }
 
 static int hostinit(void) {
@@ -276,6 +304,7 @@ static void *thread_run(void *args)
 	struct thread_info *tinfo = (struct thread_info *)args;
 	off_t roffset, woffset;
 	ssize_t count, boffset = tinfo->thread*cfg.chunk_size;
+	uint64_t chksum = 0;
 
 	roffset = tinfo->thread*((cfg.size < cfg.rsize) ? cfg.size : cfg.rsize)
 		/ cfg.threads;
@@ -287,6 +316,7 @@ static void *thread_run(void *args)
 		if (cfg.skip_read)
 			goto write;
 
+		//fprintf(stderr, "read boffest %zu roffset %zu\n", boffset, roffset);
 		count = pread(cfg.nvme_read_fd, cfg.buffer+boffset, cfg.chunk_size, roffset);
 		if (count == -1) {
 			perror("pread");
@@ -301,10 +331,20 @@ static void *thread_run(void *args)
 				exit(EXIT_FAILURE);
 			}
 		}
+		if (cfg.chksum)
+			chksum = checksum_buf16(cfg.buffer+boffset, chksum, cfg.chunk_size);
+		if (cfg.dump)
+			print_buf16(cfg.buffer+boffset, cfg.chunk_size);
 	write:
 		if (cfg.skip_write)
 			continue;
 
+		if (cfg.fill)
+			randfill(cfg.buffer+boffset, cfg.chunk_size);
+		if (cfg.chksum)
+			chksum = checksum_buf16(cfg.buffer+boffset, chksum, cfg.chunk_size);
+
+		//fprintf(stderr, "read boffest %zu woffset %zu\n", boffset, woffset);
 		count = pwrite(cfg.nvme_write_fd, cfg.buffer+boffset, cfg.chunk_size, woffset);
 		if (count == -1) {
 			perror("pwrite");
@@ -332,6 +372,9 @@ static void *thread_run(void *args)
 				return NULL;
 		}
 	}
+	if (cfg.chksum)
+		printf("Checksum 0x%lx\n", chksum); 
+
 	return NULL;
 }
 
@@ -453,6 +496,12 @@ int main(int argc, char **argv)
 		 "skip the write (can't be used with --check)"},
 		{"threads", 't', "", CFG_POSITIVE, &cfg.threads, required_argument,
 		 "number of read/write threads to use"},
+		{"dump", 0, "", CFG_NONE, &cfg.dump, no_argument,
+		 "dump 1K of read data"},
+		{"chksum", 0, "", CFG_NONE, &cfg.chksum, no_argument,
+		 "Print checsum"},
+		{"fill", 0, "", CFG_NONE, &cfg.fill, no_argument,
+		 "Print fill random data"},
 		{NULL}
 	};
 
@@ -519,6 +568,11 @@ int main(int argc, char **argv)
 		goto fail_out;
 	}
 
+	if ( cfg.seed == -1 )
+		cfg.seed = time(NULL);
+	srand(cfg.seed);
+
+	char tmp[24];
 	if (cfg.p2pmem_fd) {
 		cfg.buffer = mmap(NULL, cfg.size_mmap, PROT_READ | PROT_WRITE, MAP_SHARED,
 				  cfg.p2pmem_fd, cfg.offset);
@@ -533,11 +587,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if ( cfg.seed == -1 )
-		cfg.seed = time(NULL);
-	srand(cfg.seed);
-
-	char tmp[24];
 	sprintf(tmp, "%d", cfg.duration);
 	rval = cfg.rsize;
 	rsuf = suffix_si_get(&rval);

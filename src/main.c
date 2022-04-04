@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -79,6 +80,8 @@ static struct {
 	unsigned skip_write;
 	struct timeval time_start;
 	struct timeval time_end;
+	struct rusage usage_start;
+	struct rusage usage_end;
 	size_t   threads;
 	int      write_parity;
 	uint64_t wsize;
@@ -664,23 +667,31 @@ int main(int argc, char **argv)
 	}
 
 	gettimeofday(&cfg.time_start, NULL);
-	for (size_t t = 0; t < cfg.threads; t++) {
-		tinfo[t].thread = t;
-		int s = pthread_create(&tinfo[t].thread_id, NULL,
-				       &thread_run, &tinfo[t]);
-		if (s != 0) {
-			perror("pthread_create");
-			goto free_free_fail_out;
+	getrusage(RUSAGE_SELF, &cfg.usage_end);
+	if (cfg.threads == 1) {
+		tinfo[0].thread = 0;
+		thread_run(&tinfo[0]);
+		total += tinfo[0].total;
+	} else {
+		for (size_t t = 0; t < cfg.threads; t++) {
+			tinfo[t].thread = t;
+			int s = pthread_create(&tinfo[t].thread_id, NULL,
+					       &thread_run, &tinfo[t]);
+			if (s != 0) {
+				perror("pthread_create");
+				goto free_free_fail_out;
+			}
+		}
+		for (size_t t = 0; t < cfg.threads; t++) {
+			int s = pthread_join(tinfo[t].thread_id, NULL);
+			if (s != 0) {
+				perror("pthread_join");
+				goto free_free_fail_out;
+			}
+			total += tinfo[t].total;
 		}
 	}
-	for (size_t t = 0; t < cfg.threads; t++) {
-		int s = pthread_join(tinfo[t].thread_id, NULL);
-		if (s != 0) {
-			perror("pthread_join");
-			goto free_free_fail_out;
-		}
-		total += tinfo[t].total;
-	}
+	getrusage(RUSAGE_SELF, &cfg.usage_end);
 	gettimeofday(&cfg.time_end, NULL);
 
 	if (cfg.check) {
@@ -703,6 +714,12 @@ int main(int argc, char **argv)
 
 	fprintf(stdout, "Transfer:\n");
 	report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, total);
+	fprintf(stdout, "User CPU time used per 4K:\n");
+	report_usage_per_4k(stdout, &cfg.usage_start.ru_utime,
+			    &cfg.usage_end.ru_utime, total);
+	fprintf(stdout, "System CPU time used: per 4k\n");
+	report_usage_per_4k(stdout, &cfg.usage_start.ru_stime,
+			    &cfg.usage_end.ru_stime, total);
 	fprintf(stdout, "\n");
 
 	free(tinfo);

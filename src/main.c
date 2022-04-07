@@ -338,6 +338,9 @@ static void *thread_run(void *args)
 			chksum = checksum_buf16(cfg.buffer+boffset, chksum, cfg.chunk_size);
 		if (cfg.dump)
 			print_buf16(cfg.buffer+boffset, cfg.chunk_size);
+
+		if (cfg.skip_write)
+			tinfo->total += cfg.chunk_size;
 	write:
 		if (cfg.skip_write)
 			continue;
@@ -453,6 +456,7 @@ int main(int argc, char **argv)
 	double rval, wval, val;
 	const char *rsuf, *wsuf, *suf;
 	char *host_access, *init;
+	struct timeval delta;
 	size_t total = 0;
 
 	host_access = (char *)def_str;
@@ -667,7 +671,7 @@ int main(int argc, char **argv)
 	}
 
 	gettimeofday(&cfg.time_start, NULL);
-	getrusage(RUSAGE_SELF, &cfg.usage_end);
+	getrusage(RUSAGE_SELF, &cfg.usage_start);
 	if (cfg.threads == 1) {
 		tinfo[0].thread = 0;
 		thread_run(&tinfo[0]);
@@ -714,13 +718,13 @@ int main(int argc, char **argv)
 
 	fprintf(stdout, "Transfer:\n");
 	report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, total);
-	fprintf(stdout, "User CPU time used per 4K:\n");
-	report_usage_per_4k(stdout, &cfg.usage_start.ru_utime,
-			    &cfg.usage_end.ru_utime, total);
-	fprintf(stdout, "System CPU time used: per 4k\n");
-	report_usage_per_4k(stdout, &cfg.usage_start.ru_stime,
-			    &cfg.usage_end.ru_stime, total);
 	fprintf(stdout, "\n");
+	fprintf(stdout, "User CPU time used per:");
+	timersub(&cfg.usage_end.ru_utime, &cfg.usage_start.ru_utime, &delta);
+	fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
+	fprintf(stdout, "System CPU time used: per");
+	timersub(&cfg.usage_end.ru_stime, &cfg.usage_start.ru_stime, &delta);
+	fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
 
 	free(tinfo);
 	if (cfg.p2pmem_fd)

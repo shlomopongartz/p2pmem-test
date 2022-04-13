@@ -243,8 +243,8 @@ static int hosttest(void)
 		errno = EINVAL;
 		return -1;
 	}
-	fprintf(stdout, "MATCH on %d host accesses.\n",
-		cfg.host_accesses);
+	//fprintf(stdout, "MATCH on %d host accesses.\n",
+	//	cfg.host_accesses);
 
 	free(wdata);
 	free(rdata);
@@ -453,8 +453,9 @@ static void get_hostaccess(char *host_access) {
 
 int main(int argc, char **argv)
 {
-	double rval, wval, val;
-	const char *rsuf, *wsuf, *suf;
+	//double rval, wval, val;
+	double val;
+	//const char *rsuf, *wsuf, *suf;
 	char *host_access, *init;
 	struct timeval delta;
 	size_t total = 0;
@@ -595,40 +596,42 @@ int main(int argc, char **argv)
 	}
 
 	sprintf(tmp, "%d", cfg.duration);
-	rval = cfg.rsize;
-	rsuf = suffix_si_get(&rval);
-	wval = cfg.wsize;
-	wsuf = suffix_si_get(&wval);
-	fprintf(stdout,"Running p2pmem-test: reading %s (%.4g%sB): writing %s (%.4g%sB): "
-		"p2pmem buffer %s.\n",cfg.nvme_read_filename, rval, rsuf,
-		cfg.nvme_write_filename, wval, wsuf, cfg.p2pmem_filename);
+	//rval = cfg.rsize;
+	//rsuf = suffix_si_get(&rval);
+	//wval = cfg.wsize;
+	//wsuf = suffix_si_get(&wval);
+	//fprintf(stdout,"Running p2pmem-test: reading %s (%.4g%sB): writing %s (%.4g%sB): "
+	//	"p2pmem buffer %s.\n",cfg.nvme_read_filename, rval, rsuf,
+	//	cfg.nvme_write_filename, wval, wsuf, cfg.p2pmem_filename);
 	val = cfg.size;
-	suf = suffix_si_get(&val);
-	fprintf(stdout,"\tchunk size = %zd : number of chunks =  %zd: total = %.4g%sB : "
-		"thread(s) = %zd : overlap = %s.\n", cfg.chunk_size, cfg.chunks, val, suf,
-		cfg.threads, cfg.overlap ? "ON" : "OFF");
-	fprintf(stdout,"\tskip-read = %s : skip-write =  %s : duration = %s sec.\n",
-		cfg.skip_read ? "ON" : "OFF", cfg.skip_write ? "ON" : "OFF",
-		(cfg.duration <= 0) ? "INF" : tmp);
-	rval = cfg.size_mmap;
-	rsuf = suffix_si_get(&rval);
-	fprintf(stdout,"\tbuffer = %p (%s): mmap = %.4g%sB\n", cfg.buffer,
-		cfg.p2pmem_fd ? "p2pmem" : "system memory", rval, rsuf);
-	fprintf(stdout,"\tPAGE_SIZE = %ldB\n", cfg.page_size);
-	rval = cfg.init_tot;
-	rsuf = suffix_si_get(&rval);
-	if (cfg.init_tot)
-		fprintf(stdout,"\tinitializing %.4g%sB of buffer with zeros: alignment "
-			"and size = %dB (STOP = %s)\n", rval, rsuf, cfg.init_sz,
-			cfg.init_stop ? "ON" : "OFF");
-	rval = cfg.host_accesses;
-	rsuf = suffix_si_get(&rval);
-	if (cfg.host_accesses)
-		fprintf(stdout,"\tchecking %.4g%sB host accesses %s: alignment and size = %dB"
-			" (STOP = %s)\n", rval, rsuf, cfg.host_access_sz < 0 ? "(read only) " : "",
-			abs(cfg.host_access_sz), cfg.host_access_stop ? "ON" : "OFF");
-	if (cfg.check)
-		fprintf(stdout,"\tchecking data with seed = %d\n", cfg.seed);
+	//suf = suffix_si_get(&val);
+	//fprintf(stdout,"\tchunk size = %zd : number of chunks =  %zd: total = %.4g%sB : "
+	//	"thread(s) = %zd : overlap = %s.\n", cfg.chunk_size, cfg.chunks, val, suf,
+	//	cfg.threads, cfg.overlap ? "ON" : "OFF");
+	fprintf(stdout,"%zd , %zd, %.4g , ",
+		cfg.chunk_size, cfg.chunks, val);
+	//fprintf(stdout,"\tskip-read = %s : skip-write =  %s : duration = %s sec.\n",
+	//	cfg.skip_read ? "ON" : "OFF", cfg.skip_write ? "ON" : "OFF",
+	//	(cfg.duration <= 0) ? "INF" : tmp);
+	//rval = cfg.size_mmap;
+	//rsuf = suffix_si_get(&rval);
+	//fprintf(stdout,"\tbuffer = %p (%s): mmap = %.4g%sB\n", cfg.buffer,
+	//	cfg.p2pmem_fd ? "p2pmem" : "system memory", rval, rsuf);
+	//fprintf(stdout,"\tPAGE_SIZE = %ldB\n", cfg.page_size);
+	//rval = cfg.init_tot;
+	//rsuf = suffix_si_get(&rval);
+	//if (cfg.init_tot)
+	//	fprintf(stdout,"\tinitializing %.4g%sB of buffer with zeros: alignment "
+	//		"and size = %dB (STOP = %s)\n", rval, rsuf, cfg.init_sz,
+	//		cfg.init_stop ? "ON" : "OFF");
+	//rval = cfg.host_accesses;
+	//rsuf = suffix_si_get(&rval);
+	//if (cfg.host_accesses)
+	//	fprintf(stdout,"\tchecking %.4g%sB host accesses %s: alignment and size = %dB"
+	//		" (STOP = %s)\n", rval, rsuf, cfg.host_access_sz < 0 ? "(read only) " : "",
+	//		abs(cfg.host_access_sz), cfg.host_access_stop ? "ON" : "OFF");
+	//if (cfg.check)
+	//	fprintf(stdout,"\tchecking data with seed = %d\n", cfg.seed);
 
 	if (cfg.init_tot) {
 		if (hostinit()) {
@@ -709,22 +712,24 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (cfg.check)
-		fprintf(stdout, "%s on data check, 0x%x %s 0x%x.\n",
-			cfg.write_parity==cfg.read_parity ? "MATCH" : "MISMATCH",
-			cfg.write_parity,
-			cfg.write_parity==cfg.read_parity ? "=" : "!=",
-			cfg.read_parity);
+	//if (cfg.check)
+	//	fprintf(stdout, "%s on data check, 0x%x %s 0x%x.\n",
+	//		cfg.write_parity==cfg.read_parity ? "MATCH" : "MISMATCH",
+	//		cfg.write_parity,
+	//		cfg.write_parity==cfg.read_parity ? "=" : "!=",
+	//		cfg.read_parity);
 
-	fprintf(stdout, "Transfer:\n");
+	//fprintf(stdout, "Transfer:\n");
 	report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, total);
-	fprintf(stdout, "\n");
-	fprintf(stdout, "User CPU time used per:");
+	//fprintf(stdout, "\n");
+	//fprintf(stdout, "User CPU time used per:");
 	timersub(&cfg.usage_end.ru_utime, &cfg.usage_start.ru_utime, &delta);
-	fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
-	fprintf(stdout, "System CPU time used: per");
+	//fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
+	fprintf(stdout, "%ld.%06ld, ", delta.tv_sec, delta.tv_usec);
+	//fprintf(stdout, "System CPU time used: per");
 	timersub(&cfg.usage_end.ru_stime, &cfg.usage_start.ru_stime, &delta);
-	fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
+	//fprintf(stdout, "%ld.%06ld\n", delta.tv_sec, delta.tv_usec);
+	fprintf(stdout, "%ld.%06ld, \n", delta.tv_sec, delta.tv_usec);
 
 	free(tinfo);
 	if (cfg.p2pmem_fd)

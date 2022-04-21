@@ -29,6 +29,19 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#include <assert.h>
+
+/* if this header fill is missing install linux-libc-dev
+ * e.g. sudo apt install linux-libc-dev
+ * linux-libc-devel on Fedora???
+ * linux-libc-devel
+ * liburing-dev?
+ */
+#include <linux/io_uring.h>
+#include <liburing.h>
+
+#define QD	64
+#define BS	(32*1024)
 
 #include <argconfig/argconfig.h>
 #include <argconfig/report.h>
@@ -36,6 +49,20 @@
 #include <argconfig/timing.h>
 
 #include "version.h"
+
+
+#if defined(__x86_64__)
+#define mb()	asm volatile("mfence" : : : "memory")
+#define rmb()   asm volatile("lfence" : : : "memory")
+#define wmb()   asm volatile("sfence" : : : "memory")
+#define read_brrier()	asm volatile("lfence" : : : "memory")
+#define write_barrier()	asm volatile("sfence" : : : "memory")
+#else
+#error "Define memory barrier to the architecture"
+#endif
+
+#define likely(x)   	__builtin_expect(!!(x), 1)
+#define unlikely(x) 	__builtin_expect(!!(x), 0)
 
 #define min(a, b)				\
 	({ __typeof__ (a) _a = (a);		\
@@ -88,7 +115,9 @@ static struct {
 	unsigned dump;
 	unsigned chksum;
 	unsigned fill;
+	unsigned iodepth;
 } cfg = {
+	.buffer         = 0,
 	.check          = 0,
 	.chunk_size     = 4096,
 	.chunks         = 1024,
@@ -108,13 +137,443 @@ static struct {
 	.dump           = 0,
 	.chksum         = 0,
 	.fill           = 0,
+	.iodepth	= QD,
 };
 
+struct context;
 struct thread_info {
 	pthread_t thread_id;
 	size_t    thread;
 	size_t    total;
+	struct context *ctx;
 };
+
+struct io_data {
+	int read;
+	off_t first_offset, offset;
+	char *first_buf;
+	size_t first_len;
+	struct iovec iov;
+};
+
+struct context {
+	struct io_uring ring;
+	struct io_data *iod;
+	struct io_data **iodp;
+	unsigned iod_size;
+	unsigned sp;
+	char *buffer;
+};
+
+static int setup_context(unsigned entries, struct context *ctx)
+{
+	int ret;
+	unsigned iod_size;
+	int i;
+	char *buf;
+
+	if (entries & (entries - 1)) {
+		/* Not power of two */
+		iod_size = 1 << (32 - __builtin_clz (entries - 1));
+	} else {
+		iod_size = entries;
+	}
+	ctx->iod = calloc(iod_size, sizeof(struct io_data) + sizeof(void *));
+	if (!ctx->iod) {
+		perror("calloc");
+		return -1;
+	}
+
+	ret = io_uring_queue_init(entries, &ctx->ring, 0);
+	if (ret < 0) {
+		fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+		free(ctx->iod);
+		ctx->iod = NULL;
+		return -1;
+	}
+	ctx->iodp = (struct io_data **) &ctx->iod[iod_size];
+	buf = cfg.buffer;
+	for (i = 0; i < iod_size; i++) {
+		ctx->iodp[i] = &ctx->iod[i];
+		ctx->iod[i].first_buf = buf;
+		buf += cfg.chunk_size;
+	}
+	ctx->sp = ctx->iod_size = iod_size;
+	
+	return 0;
+}
+
+struct io_data* get_io_data(struct context *ctx)
+{
+	if (ctx->sp == 0)
+		return NULL;
+	ctx->sp--;
+	return ctx->iodp[ctx->sp];
+}
+
+int put_io_data(struct context *ctx, struct io_data *id)
+{
+	if (ctx->sp == ctx->iod_size)
+		return -1;
+	ctx->iodp[ctx->sp] = id;
+	ctx->sp++;
+	return 0;
+} 
+
+#if 0
+static int get_file_size(int fd, off_t *size)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) < 0)
+		return -1;
+	if (S_ISREG(st.st_mode)) {
+		*size = st.st_size;
+		return 0;
+	} else if (S_ISBLK(st.st_mode)) {
+		unsigned long long bytes;
+
+		if (ioctl(fd, BLKGETSIZE64, &bytes) != 0)
+			return -1;
+
+		*size = bytes;
+		return 0;
+	}
+
+	return -1;
+}
+#endif
+
+static void queue_prepped(struct io_uring *ring, int fd, struct io_data *data)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(ring);
+	assert(sqe);
+
+	if (data->read)
+		io_uring_prep_readv(sqe, fd, &data->iov, 1, data->offset);
+	else
+		io_uring_prep_writev(sqe, fd, &data->iov, 1, data->offset);
+
+	io_uring_sqe_set_data(sqe, data);
+}
+
+static int queue_io(struct context *ctx, int op, int fd, off_t size, off_t offset)
+{
+	struct io_uring_sqe *sqe;
+	struct io_data *data;
+	struct io_uring *ring = &ctx->ring;
+
+	data = get_io_data(ctx);
+	if (!data)
+		return 1;
+
+	sqe = io_uring_get_sqe(ring);
+	if (!sqe) {
+		free(data);
+		return 1;
+	}
+
+	data->read = op;
+	data->offset = data->first_offset = offset;
+
+	data->iov.iov_base = data->first_buf;
+	data->iov.iov_len = size;
+	data->first_len = size;
+
+
+	if (data->read)
+		io_uring_prep_readv(sqe, fd, &data->iov, 1, offset);
+	else
+		io_uring_prep_writev(sqe, fd, &data->iov, 1, offset);
+
+	io_uring_sqe_set_data(sqe, data);
+	return 0;
+}
+
+static int queue_read(struct context *ctx, off_t size, off_t offset)
+{
+	return queue_io(ctx, 1, cfg.nvme_read_fd, size, offset);
+}
+
+static void queue_copy(struct context *ctx, struct io_data *data)
+{
+	struct io_uring *ring = &ctx->ring;
+
+	data->read = 0;
+	data->offset = data->first_offset;
+
+	data->iov.iov_base = data->first_buf;
+	data->iov.iov_len = data->first_len;
+
+	queue_prepped(ring, cfg.nvme_write_fd, data);
+	io_uring_submit(ring);
+}
+
+static int io_file(struct context *ctx, int fd, int op, off_t filesize)
+{
+	unsigned long ios;
+	struct io_uring_cqe *cqe;
+	off_t offset;
+	int ret;
+	struct io_uring *ring = &ctx->ring;
+
+	ios = offset = 0;
+
+	while (filesize) {
+		unsigned long had_ios;
+		int got_comp;
+
+		/*
+		 * Queue up as many reads as we can
+		 */
+		had_ios = ios;
+		while (filesize) {
+			off_t this_size = filesize;
+
+			if (ios >= cfg.iodepth)
+				break;
+			if (this_size > cfg.chunk_size)
+				this_size = cfg.chunk_size;
+			else if (!this_size)
+				break;
+
+			if (queue_io(ctx, op, fd, this_size, offset))
+				break;
+
+			filesize -= this_size;
+			offset += this_size;
+			ios++;
+		}
+
+		if (had_ios != ios) {
+			ret = io_uring_submit(ring);
+			if (ret < 0) {
+				fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+				break;
+			}
+		}
+
+		/*
+		 * Queue is full at this point. Find at least one completion.
+		 */
+		got_comp = 0;
+		while (filesize) {
+			struct io_data *data;
+
+			if (!got_comp) {
+				ret = io_uring_wait_cqe(ring, &cqe);
+				got_comp = 1;
+			} else {
+				ret = io_uring_peek_cqe(ring, &cqe);
+				if (ret == -EAGAIN) {
+					cqe = NULL;
+					ret = 0;
+				}
+			}
+			if (ret < 0) {
+				fprintf(stderr, "io_uring_peek_cqe: %s\n",
+							strerror(-ret));
+				return 1;
+			}
+			if (!cqe)
+				break;
+
+			data = io_uring_cqe_get_data(cqe);
+			if (cqe->res < 0) {
+				if (cqe->res == -EAGAIN) {
+					queue_prepped(ring, fd, data);
+					io_uring_submit(ring);
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				fprintf(stderr, "cqe failed: %s\n",
+						strerror(-cqe->res));
+				return 1;
+			} else if ((size_t)cqe->res != data->iov.iov_len) {
+				/* Short read/write, adjust and requeue */
+				data->iov.iov_base += cqe->res;
+				data->iov.iov_len -= cqe->res;
+				data->offset += cqe->res;
+				queue_prepped(ring, fd, data);
+				io_uring_submit(ring);
+				io_uring_cqe_seen(ring, cqe);
+				continue;
+			}
+
+			/*
+			 * All done. if write, nothing else to do. if read,
+			 * queue up corresponding write.
+			 */
+			put_io_data(ctx, data);
+			ios--;
+			io_uring_cqe_seen(ring, cqe);
+		}
+	}
+
+	/* wait out pending reads */
+	while (ios) {
+		struct io_data *data;
+
+		ret = io_uring_wait_cqe(ring, &cqe);
+		if (ret) {
+			fprintf(stderr, "wait_cqe=%d ios=%ld\n", ret, ios);
+			return 1;
+		}
+		if (cqe->res < 0) {
+			fprintf(stderr, "io res=%d ios=%ld\n", cqe->res, ios);
+			return 1;
+		}
+		data = io_uring_cqe_get_data(cqe);
+		put_io_data(ctx, data);
+		ios--;
+		io_uring_cqe_seen(ring, cqe);
+	}
+
+	return 0;
+}
+
+static int read_file(struct context *ctx, off_t filesize)
+{
+	return io_file(ctx, cfg.nvme_read_fd, 1, filesize);
+}
+
+static int write_file(struct context *ctx, off_t filesize)
+{
+	return io_file(ctx, cfg.nvme_write_fd, 0, filesize);
+}
+
+static int copy_file(struct context *ctx, off_t filesize)
+{
+	unsigned long reads, writes;
+	struct io_uring_cqe *cqe;
+	off_t write_left, offset;
+	int ret;
+	struct io_uring *ring = &ctx->ring;
+
+	write_left = filesize;
+	writes = reads = offset = 0;
+
+	while (filesize || write_left) {
+		unsigned long had_reads;
+		int got_comp;
+	
+		/*
+		 * Queue up as many reads as we can
+		 */
+		had_reads = reads;
+		while (filesize) {
+			off_t this_size = filesize;
+
+			if (reads + writes >= cfg.iodepth)
+				break;
+			if (this_size > cfg.chunk_size)
+				this_size = cfg.chunk_size;
+			else if (!this_size)
+				break;
+
+			if (queue_read(ctx, this_size, offset))
+				break;
+
+			filesize -= this_size;
+			offset += this_size;
+			reads++;
+		}
+
+		if (had_reads != reads) {
+			ret = io_uring_submit(ring);
+			if (ret < 0) {
+				fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+				break;
+			}
+		}
+
+		/*
+		 * Queue is full at this point. Find at least one completion.
+		 */
+		got_comp = 0;
+		while (write_left) {
+			struct io_data *data;
+
+			if (!got_comp) {
+				ret = io_uring_wait_cqe(ring, &cqe);
+				got_comp = 1;
+			} else {
+				ret = io_uring_peek_cqe(ring, &cqe);
+				if (ret == -EAGAIN) {
+					cqe = NULL;
+					ret = 0;
+				}
+			}
+			if (ret < 0) {
+				fprintf(stderr, "io_uring_peek_cqe: %s\n",
+							strerror(-ret));
+				return 1;
+			}
+			if (!cqe)
+				break;
+
+			data = io_uring_cqe_get_data(cqe);
+			if (cqe->res < 0) {
+				if (cqe->res == -EAGAIN) {
+					queue_prepped(ring, cfg.nvme_read_fd, data);
+					io_uring_submit(ring);
+					io_uring_cqe_seen(ring, cqe);
+					continue;
+				}
+				fprintf(stderr, "cqe failed: %s\n",
+						strerror(-cqe->res));
+				return 1;
+			} else if ((size_t)cqe->res != data->iov.iov_len) {
+				/* Short read/write, adjust and requeue */
+				data->iov.iov_base += cqe->res;
+				data->iov.iov_len -= cqe->res;
+				data->offset += cqe->res;
+				queue_prepped(ring, cfg.nvme_read_fd, data);
+				io_uring_submit(ring);
+				io_uring_cqe_seen(ring, cqe);
+				continue;
+			}
+
+			/*
+			 * All done. if write, nothing else to do. if read,
+			 * queue up corresponding write.
+			 */
+			if (data->read) {
+				queue_copy(ctx, data);
+				write_left -= data->first_len;
+				reads--;
+				writes++;
+			} else {
+				put_io_data(ctx, data);
+				writes--;
+			}
+			io_uring_cqe_seen(ring, cqe);
+		}
+	}
+
+	/* wait out pending writes */
+	while (writes) {
+		struct io_data *data;
+
+		ret = io_uring_wait_cqe(ring, &cqe);
+		if (ret) {
+			fprintf(stderr, "wait_cqe=%d writes=%ld\n", ret, writes);
+			return 1;
+		}
+		if (cqe->res < 0) {
+			fprintf(stderr, "write res=%d writes=%ld\n", cqe->res, writes);
+			return 1;
+		}
+		data = io_uring_cqe_get_data(cqe);
+		put_io_data(ctx, data);
+		writes--;
+		io_uring_cqe_seen(ring, cqe);
+	}
+
+	return 0;
+}
 
 static void randfill(void *buf, size_t len)
 {
@@ -150,6 +609,8 @@ static void print_buf(void *buf, size_t len)
 		printf("%02X", cbuf[i]);
 }
 
+
+#if 0
 static void print_buf16(void *buf, size_t len)
 {
 	uint8_t *cbuf = buf;
@@ -171,6 +632,8 @@ static uint64_t checksum_buf16(void *buf, uint64_t prev, size_t len)
 
 	return prev;
 }
+#endif
+
 
 static int hostinit(void) {
 
@@ -305,81 +768,15 @@ out:
 static void *thread_run(void *args)
 {
 	struct thread_info *tinfo = (struct thread_info *)args;
-	off_t roffset, woffset;
-	ssize_t count, boffset = tinfo->thread*cfg.chunk_size;
-	uint64_t chksum = 0;
+	struct context *ctx = tinfo->ctx;
 
-	roffset = tinfo->thread*((cfg.size < cfg.rsize) ? cfg.size : cfg.rsize)
-		/ cfg.threads;
-	woffset = tinfo->thread*((cfg.size < cfg.wsize) ? cfg.size : cfg.wsize)
-		/ cfg.threads;
-
-	for (size_t i=0; i<cfg.chunks/cfg.threads; i++) {
-
-		if (cfg.skip_read)
-			goto write;
-
-		//fprintf(stderr, "read boffest %zu roffset %zu\n", boffset, roffset);
-		count = pread(cfg.nvme_read_fd, cfg.buffer+boffset, cfg.chunk_size, roffset);
-		if (count == -1) {
-			perror("pread");
-			exit(EXIT_FAILURE);
-		}
-		roffset += cfg.chunk_size;
-		if (roffset >= (tinfo->thread+1)*cfg.rsize/cfg.threads) {
-			if (cfg.overlap) {
-				roffset = tinfo->thread*cfg.rsize/cfg.threads;
-			} else {
-				perror("read-overflow");
-				exit(EXIT_FAILURE);
-			}
-		}
-		if (cfg.chksum)
-			chksum = checksum_buf16(cfg.buffer+boffset, chksum, cfg.chunk_size);
-		if (cfg.dump)
-			print_buf16(cfg.buffer+boffset, cfg.chunk_size);
-
-		if (cfg.skip_write)
-			tinfo->total += cfg.chunk_size;
-	write:
-		if (cfg.skip_write)
-			continue;
-
-		if (cfg.fill)
-			randfill(cfg.buffer+boffset, cfg.chunk_size);
-		if (cfg.chksum)
-			chksum = checksum_buf16(cfg.buffer+boffset, chksum, cfg.chunk_size);
-
-		//fprintf(stderr, "read boffest %zu woffset %zu\n", boffset, woffset);
-		count = pwrite(cfg.nvme_write_fd, cfg.buffer+boffset, cfg.chunk_size, woffset);
-		if (count == -1) {
-			perror("pwrite");
-			exit(EXIT_FAILURE);
-		}
-		woffset += cfg.chunk_size;
-		if (woffset >= (tinfo->thread+1)*cfg.wsize/cfg.threads) {
-			if (cfg.overlap) {
-				woffset = tinfo->thread*cfg.wsize/cfg.threads;
-			} else {
-				perror("write-overflow");
-				exit(EXIT_FAILURE);
-			}
-		}
-
-		tinfo->total += cfg.chunk_size;
-		if (cfg.duration > 0) {
-			struct timeval time_now;
-			double elapsed_time;
-
-			gettimeofday(&time_now, NULL);
-			elapsed_time = timeval_to_secs(&time_now) -
-				timeval_to_secs(&cfg.time_start);
-			if (elapsed_time > (double)cfg.duration)
-				return NULL;
-		}
+	if (cfg.skip_read) {
+		write_file(ctx, cfg.size);
+	} else if (cfg.skip_write) {
+		read_file(ctx, cfg.size);
+	} else {
+		copy_file(ctx, cfg.size);
 	}
-	if (cfg.chksum)
-		printf("Checksum 0x%lx\n", chksum); 
 
 	return NULL;
 }
@@ -458,6 +855,7 @@ int main(int argc, char **argv)
 	//const char *rsuf, *wsuf, *suf;
 	char *host_access, *init;
 	struct timeval delta;
+	struct context ctx;
 	size_t total = 0;
 
 	host_access = (char *)def_str;
@@ -510,15 +908,28 @@ int main(int argc, char **argv)
 		 "Print checsum"},
 		{"fill", 0, "", CFG_NONE, &cfg.fill, no_argument,
 		 "Print fill random data"},
+		{"iodepth", 0, "", CFG_POSITIVE, &cfg.iodepth, required_argument,
+		 "iodpeth (default 1)"},
 		{NULL}
 	};
 
 	argconfig_parse(argc, argv, desc, opts, &cfg, sizeof(cfg));
 	cfg.page_size = sysconf(_SC_PAGESIZE);
 	cfg.size = cfg.chunk_size*cfg.chunks;
+#if 0
 	cfg.size_mmap = cfg.chunk_size*cfg.threads;
+#else
+	/* Should be cfg.chunk_size * cfg.threads* cfg.iodepth*/
+	cfg.size_mmap = cfg.chunk_size*cfg.iodepth;
+#endif
 	get_hostaccess(host_access);
 	get_init(init);
+
+	/* Currently no support for multithreads */
+	if (cfg.threads > 1) {
+		fprintf(stderr, "Multithread is not yet supported\n");
+		cfg.threads = 1;
+	}
 
 	if (ioctl(cfg.nvme_read_fd, BLKGETSIZE64, &cfg.rsize)) {
 		perror("ioctl-read");
@@ -589,11 +1000,14 @@ int main(int argc, char **argv)
 			goto fail_out;
 		}
 	} else {
-		if (posix_memalign(&cfg.buffer, cfg.page_size, cfg.chunk_size*cfg.threads)) {
+		if (posix_memalign(&cfg.buffer, cfg.page_size, cfg.size_mmap)) {
 			perror("posix_memalign");
 			goto fail_out;
 		}
 	}
+
+	if (setup_context(cfg.iodepth, &ctx))
+		return -1;
 
 	sprintf(tmp, "%d", cfg.duration);
 	//rval = cfg.rsize;
@@ -677,11 +1091,13 @@ int main(int argc, char **argv)
 	getrusage(RUSAGE_SELF, &cfg.usage_start);
 	if (cfg.threads == 1) {
 		tinfo[0].thread = 0;
+		tinfo[0].ctx = &ctx;
 		thread_run(&tinfo[0]);
 		total += tinfo[0].total;
 	} else {
 		for (size_t t = 0; t < cfg.threads; t++) {
 			tinfo[t].thread = t;
+			tinfo[t].ctx = &ctx;
 			int s = pthread_create(&tinfo[t].thread_id, NULL,
 					       &thread_run, &tinfo[t]);
 			if (s != 0) {
@@ -720,7 +1136,8 @@ int main(int argc, char **argv)
 	//		cfg.read_parity);
 
 	//fprintf(stdout, "Transfer:\n");
-	report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, total);
+	//report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, total);
+	report_transfer_rate(stdout, &cfg.time_start, &cfg.time_end, cfg.size);
 	//fprintf(stdout, "\n");
 	//fprintf(stdout, "User CPU time used per:");
 	timersub(&cfg.usage_end.ru_utime, &cfg.usage_start.ru_utime, &delta);
@@ -736,6 +1153,9 @@ int main(int argc, char **argv)
 		munmap(cfg.buffer, cfg.chunk_size);
 	else
 		free(cfg.buffer);
+
+
+	io_uring_queue_exit(&ctx.ring);
 
 	return EXIT_SUCCESS;
 
